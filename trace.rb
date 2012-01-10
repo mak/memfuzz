@@ -22,11 +22,12 @@ end
 class Trace
 
   attr_reader :owned
-  def initialize(eqFuncList,file,inp)
+  def initialize(eqFuncList,file,inp,dasm=nil)
     @eqFuncList = eqFuncList
     @dbg = OS.current.create_debugger(file + " " + inp)
     @input = inp
-    @dasm = AutoExe.decode_file(file).disassemble
+    @dasm = dasm
+    @dasm ||= AutoExe.decode_file(file).disassemble
     @funcList = find_functions
     @owned = {}
     setup = @funcList.map { |a| {:address => a, :condition => false}}
@@ -34,9 +35,16 @@ class Trace
   end
 
   def find_functions
+    l = nil
     @dasm.load_plugin 'dasm_all'
     @dasm.dasm_all_section '.text'
-    @dasm.function.keys.select{ |x| x.kind_of? Integer}
+    @dasm.function.keys.select do |x|
+      f = f2 = false
+      f = l.first =~ /^thunk/ if l= @dasm.label_alias[x]
+      f2 = l.first =~ /^entrypoint/ if l = @dasm.label_alias[x]
+      x.kind_of? Integer  and not (f or f2)
+    end
+
   end
 
   def get_section_addr(name)
@@ -52,8 +60,7 @@ class Trace
         i += 1
         b = case f
             when Symbol
-              send f, @dbg,@dasm,@input,x
-            when Proc
+              send f, @dbg,@dasm,@input,x            when Proc
               f.call(@dbg,@dasm,@input,x)
             end
         owned_args << i if b

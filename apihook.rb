@@ -17,81 +17,87 @@
 require 'metasm'
 
 class ApiHook
-	attr_accessor :dbg
+  attr_accessor :dbg
 
-	# rewrite this function to list the hooks you want
-	# return an array of hashes
-	# def setup
-	# 	#[{ :function => 'WriteFile', :abi => :stdcall },	# standard function hook
-	# 	# { :module => 'Foo.dll', :rva => 0x2433,		# arbitrary code hook
-	# 	#   :abi => :fastcall, :hookname => 'myhook' }]		# hooks named pre_myhook/post_myhook
-	# end
+  # rewrite this function to list the hooks you want
+  # return an array of hashes
+  # def setup
+  # 	#[{ :function => 'WriteFile', :abi => :stdcall },	# standard function hook
+  # 	# { :module => 'Foo.dll', :rva => 0x2433,		# arbitrary code hook
+  # 	#   :abi => :fastcall, :hookname => 'myhook' }]		# hooks named pre_myhook/post_myhook
+  # end
 
-	# initialized from a Debugger or a process description that will be debugged
+  # initialized from a Debugger or a process description that will be debugged
 	# sets the hooks up, then run_forever
-	def initialize(dbg,setup,pre,post)
-		if not dbg.kind_of? Metasm::Debugger
-			process = Metasm::OS.current.find_process(dbg)
-			raise 'no such process' if not process
-			dbg = process.debugger
-		end
-                @pre = pre
-                @post = post
-		@dbg = dbg
-		begin
-			setup.each { |h| setup_hook(h) }
-			init_prerun if respond_to?(:init_prerun)	# allow subclass to do stuff before main loop
-			@dbg.run_forever
-		rescue Interrupt
-			@dbg.detach #rescue nil
-		end
-	end
+  def initialize(dbg,setup,pre,post)
+    if not dbg.kind_of? Metasm::Debugger
+      process = Metasm::OS.current.find_process(dbg)
+      raise 'no such process' if not process
+      dbg = process.debugger
+    end
+    @pre = pre
+    @post = post
+    @dbg = dbg
+    if setup.size > 4
+      @bpx = lambda { |*a,&b| @dbg.bpx(*a,&b) }
+    else
+      $stderr.puts "using hdbp"
+      @bpx = lambda {|*a,&b| @dbg.hwbp(*a,&b) }
+    end
+    begin
+      setup.each { |h| setup_hook(h) }
+      init_prerun if respond_to?(:init_prerun)	# allow subclass to do stuff before main loop
+      @dbg.run_forever
+    rescue Interrupt
+      @dbg.detach #rescue nil
+    end
+  end
 
-	# setup one function hook
-	def setup_hook(h)
-		@las ||= false
-		if not h[:lib] and not @las
-			@dbg.loadallsyms
-			@las = false
-		elsif h[:lib]
-			# avoid loadallsyms if specified (regexp against pathname, not exported lib name)
-			@dbg.loadsyms(h[:lib])
-		end
+  # setup one function hook
+  def setup_hook(h)
+    @las ||= false
+    if not h[:lib] and not @las
+      @dbg.loadallsyms
+      @las = false
+    elsif h[:lib]
+      # avoid loadallsyms if specified (regexp against pathname, not exported lib name)
+      @dbg.loadsyms(h[:lib])
+    end
 
-		nargs = 10 #h[:nargs] || method(pre).arity if respond_to?(pre)
+    nargs = 10 #h[:nargs] || method(pre).arity if respond_to?(pre)
 
-		if target = h[:address]
-		elsif target = h[:rva]
-			modbase = @dbg.modulemap[h[:module]]
-			raise "cant find module #{h[:module]}" if not modbase #in #{@dbg.modulemap.join(', ')}" if not modbase
-			target += modbase[0]
-		else
-			target = h[:function]
-		end
+    if target = h[:address]
+    elsif target = h[:rva]
+      modbase = @dbg.modulemap[h[:module]]
+      raise "cant find module #{h[:module]}" if not modbase #in #{@dbg.modulemap.join(', ')}" if not modbase
+      target += modbase[0]
+    else
+      target = h[:function]
+    end
 
-		@dbg.bpx(target, false, h[:condition]) {
-			@nargs = nargs
-			catch(:finish) {
-				@cur_abi = h[:abi]
-				@ret_longlong = h[:ret_longlong]
-                                args = read_arglist
-                                @pre.call(args) if @pre
+    @bpx.call(target, false, h[:condition]) {
+      @nargs = nargs
+      catch(:finish) {
+        @cur_abi = h[:abi]
+        @ret_longlong = h[:ret_longlong]
+        args = read_arglist
+        @pre.call(args) if @pre
 
-			 	@dbg.bpx(@dbg.func_retaddr, true) {
-						retval = read_ret
-						@post.call(retval,args)
-					} if @post
-			}
-		}
-	end
+        @bpx.call(@dbg.func_retaddr, true) {
+          retval = read_ret
+          @post.call(retval,args)
+        } if @post
+      }
+    }
+  end
 
-	# retrieve the arglist at func entry, from @nargs & @cur_abi
+  # retrieve the arglist at func entry, from @nargs & @cur_abi
 	def read_arglist
 		nr = @nargs
 		args = []
 
 		if (@cur_abi == :fastcall or @cur_abi == :thiscall) and nr > 0
-			args << @dbg.get_reg_value(:ecx)
+                  args << @dbg.get_reg_value(:ecx)
 			nr -= 1
 		end
 

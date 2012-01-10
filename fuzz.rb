@@ -7,13 +7,34 @@ require 'metasm'
 
 include Metasm
 
+class MallocFail < RuntimeError
+end
+
+class String
+  alias :len :length
+end
+
+class Bignum
+  def hex; self.to_s(16)  end
+end
+
+class Fixnum
+  def hex; self.to_s(16)  end
+end
+
 
 class FuzzMem < ApiHook
 
-  def initialize(file,inp)
+  attr_reader :bps, :dasm
+  def initialize(file,inp,bps=nil,dasm=nil)
 
     $stderr.puts "tracing...\n\n"
-    @bps = Trace.new(eqFuncsList,file,inp).owned
+
+    @dasm = dasm
+    @dasm ||= AutoExe.decode_file(file).disassemble
+
+    @bps = bps
+    @bps ||= Trace.new(eqFuncsList,file,inp,@dasm).owned
 
     raise "Sorry you haven't control any function arguments, cant fuzz..." if @bps.empty?
 
@@ -23,11 +44,22 @@ class FuzzMem < ApiHook
     @fuzz = {}
     @file = File.open(file + '.' + @dbg.pid.to_s + '.fuzz','wb')
 
-    @dasm = AutoExe.decode_file(file).disassemble
+    @ret_reg  = case @dbg.cpu.shortname
+                  when 'x64'  then :rax
+                  when 'ia32' then :eax
+                  else raise 'unsupported arch'
+                end
+
+    @base_reg  = case @dbg.cpu.shortname
+                  when 'x64'  then :rbp
+                  when 'ia32' then :ebp
+                  else raise 'unsupported arch'
+                end
+
 
     $stderr.puts "\n\n#{file}@#{@dbg.pid}: fuzzing ...\n"
     setup = @bps.map { |f| {:address => f[0], :condition => false}}
-    ApiHook.new(@dbg,setup,lambda {|a| hook(a)},nil)
+    super(@dbg,setup,lambda {|a| hook(a)},nil)
     File.unlink(@file.path) if @file.size == 0
     @file.close
     print "\n"
@@ -35,136 +67,124 @@ class FuzzMem < ApiHook
 
   def rep_vuln(status)
 
-    fbeg = @dasm.find_function_start(@fuzz[:addr])
-    name = @dasm.label_alias[fbeg].first || fbeg
-    i=1
-
-    $stderr.puts "#### SIG#{status[:signal]} ####\n"
+    $stderr.puts "\n#### SIG#{status[:signal]} ####\n"
     case status[:signal]
       when "SEGV", "ABRT", "FPE", "ILL"
       then
-
+        @file.puts @dbg.di_at @dbg.pc
         @file.puts "\nPid #{status[:status].pid} got SIG#{status[:signal]}! ;]\n"
-        @file.puts "Fuzzed #{name}@#{fbeg.inspect} with\n"
-        @fuzz[fbeg].each { |n,a|
-          @file.puts "\targ_#{n}:\t#{a.inspect}\n"
+        @fuzz.each { |fbeg,store|
+          name = (@dasm.label_alias[fbeg] || [fbeg]).first
+          @file.puts "Fuzzed #{name}@#{fbeg.inspect} with\n"
+          store[:fuzz].each { |n,a|
+            @file.puts "\targ_#{n}:\t#{a.inspect}\n"
+          }
         }
+        stacktrace
+        @file.puts @dbg.ctx.do_getregs
+        @file.flush
     end
   end
 
+  def stacktrace
+    @file.puts "\nBacktrace: "
+    @dbg.stacktrace.reverse { |a,n| @file.puts "#{n}@#{a.hex}" }
+  end
+
   def hook(args)
-    fbeg = @dasm.find_function_start(@dbg.pc)
-    @fuzz[fbeg] = []
 
-    own = @bps[fbeg] || []
-    own.each { |i|
-      str = @rnd.rndFunc.call
-      if a=alloc(str)
-        @fuzz[:addr]=fbeg
-        patch_arg(i,a) # one push after
-        @dbg.sp = @dbg.resolve Expression[:esp,:-,str.length+1+8]
-        @fuzz[fbeg] << [i,str]
+    fbeg = @dasm.find_function_start(@dbg.pc) #.instruction.args)
+    @fuzz[fbeg] ||= {}
+    @fuzz[fbeg][:alloc] ||= []
+    @fuzz[fbeg][:fuzz] ||= []
+
+    if not @fuzz[fbeg][:alloc].empty?
+      @fuzz[fbeg][:alloc].each { |i,str|
+        ret = @dbg.func_retval
+        $stderr.puts "malloc ret: #{ret.hex}"
+        @dbg[ret,str.len] = str
+        @dbg.sp += (@dbg.cpu.size/8) ## ret does pop last arg
+        patch_arg(i-1,ret)
+        @fuzz[fbeg][:fuzz] << [i,str]
+      }
+
+    else
+      (@bps[fbeg] || []).each do |i|
+        str = @rnd.rndFunc[]
+        alloc(str)
+        @fuzz[fbeg][:alloc] << [i,str]
       end
+    end
 
-    }
   end
 
 
   ### treat @str@ as local variable to function
   def alloc(str)
 
-    func = @dasm.function_at(@dbg.pc)
-    return nil if func.nil? or func.return_address.nil?
-    leave = false
+    # func = @dasm.function_at(@dbg.pc)
+    # return nil if func.nil? or func.return_address.nil?
+    # leave = false
 
-    def is_end?(di)
-      (leave = true; di.opcode.name =~ /^leave$/) or
-      (di.opcode.name =~ /^pop$/ and  di.instruction.args[0].symbolic == :ebp and
-      @dbg.di_at(di.address+1).opcode.name =~ /^ret$/)
-    end
+    # def is_end?(di)
+    #   (leave = true; di.opcode.name =~ /^leave$/) or
+    #   (di.opcode.name =~ /^pop$/ and  di.instruction.args[0].symbolic == :ebp and
+    #   @dbg.di_at(di.address+1).opcode.name =~ /^ret$/)
+    # end
 
-    def is_mov_ebp_esp?
-      di = @dbg.di_at @dbg.pc
-      fst,snd = @dbg.di_at(@dbg.pc).instruction.args.map { |a| a.symbolic}
-      di.opcode.name =~ /^mov$/ and fst == :ebp and snd == :esp
-    end
+    # def is_mov_ebp_esp?
+    #   di = @dbg.di_at @dbg.pc
+    #   fst,snd = @dbg.di_at(@dbg.pc).instruction.args.map { |a| a.symbolic}
+    #   di.opcode.name =~ /^mov$/ and fst == @base_reg and snd == @dbg.register_sp
+    # end
 
-    def is_stack_align?
-      di = @dbg.di_at @dbg.pc
-      reg = @dbg.di_at(@dbg.pc).instruction.args.first.symbolic
-      di.opcode.name =~ /^sub$/ and reg == :esp
-    end
+    # def is_stack_align?
+    #   di = @dbg.di_at @dbg.pc
+    #   reg = @dbg.di_at(@dbg.pc).instruction.args.first.symbolic
+    #   di.opcode.name =~ /^sub$/ and reg == @dbg.register_sp
+    # end
 
-    ret = @dasm.block_including(func.return_address.first).list.find {
-      |di| is_end?(di)
-    }.address
-    old_ebp = @dbg[:ebp]
-    old_eip = @dbg.memory_read_int(@dbg.sp)
-    @dbg.singlestep_wait until is_mov_ebp_esp?
-    @dbg.singlestep_wait # one more ;]
-    ebp  = @dbg[:ebp]
+    str << "\x00" if str[-1] != "\x00"
+    malloc(str)
+  end
 
-    @dbg.singlestep_wait until is_stack_align?
-    loc_len = @dbg.resolve @dbg.di_at(@dbg.pc).instruction.args[1]
-
-    addr = @dbg.sp-(4+loc_len+str.length+1)
-    @dbg[addr,str.length+1] = str+"\x00"
-
-    @dbg.bpx(ret,true) {
-      @dbg.sp = ebp
-    } if not leave
-    return addr
+  def find_libc
+    mc = @dbg.modules.find { |m| m.path =~ /^\/lib.*\/libc/}
+    return [mc.addr,mc.path]
   end
 
   ### find malloc adres based od libc offset
-  ### TODO: how to use dl_resolve inside process?
   def find_malloc
-    path,base = @dbg.modules.select{ |m| m.path.include? 'libc'}.
-                 map{|m| [m.path,m.addr]}.first
-    foo = AutoExe.decode_file(path)
-    p foo.segments
-    mall = foo.relocations.select { |r| r.symbol.name =~ /^malloc$/ }
-
-    mall.each { |x| p x ; p foo.fileoff_to_addr(x.offset) }
-    off = AutoExe.decode_file(path).module_symbols.select{ | x | x[0] == "malloc" }.first[1]
-
-    p off
-    base + off
+    base,path = find_libc
+    bin = AutoExe.decode_file(path)
+    off = bin.label_addr('malloc')
+    return (off > base ? off : base + off)
   end
 
   ### deref malloc address from .got
   def deref_malloc
+    bin = AutoExe.decode_file("/proc/#{@dbg.pid}/exe")
+    if got = bin.relocations.find {|r| r.symbol.name == /^malloc$/ }
+      base,path = find_libc
+      a = got.offset
+      return ( a > base ? a : @dbg.memory_read_int(a) )
+    end
+    return nil
+  end
 
+  def push_x86(arg)
+    @dbg.sp -= 4
+    @dbg[@dbg.sp,4] = [arg].pack('V')
   end
 
   ## only x86-linux at this point
   def malloc(str)
-    save_sp   =@dbg.get_reg_value(@dbg.register_sp)
-    save_args =@dbg[save_sp,(@dbg.cpu.size/8)*2]
-    oldpc =  @dbg.pc
-    malloc_addr = deref_malloc || find_malloc
-    eax = nil
-    @dbg[save_sp,(@dbg.cpu.size/8)*2] = [oldpc,str.size+1].pack('V*')
-    p @dbg.pc
-    p malloc_addr
-    @dbg.pc = malloc_addr
-    @dbg.bpx(oldpc,true) {
-      @dbg[save_sp,save_args.size] = save_args
-      @dbg[:eax,str.size+1] = str+"\x00"
+    malloc_addr = find_malloc
+    $stderr.puts "[*] hooking call to malloc@#{malloc_addr.hex} ret: #{@dbg.pc.hex}"
 
-      eax = @dbg[:eax]
-      raise 'Can not alloc space for fuzz string...' if eax == 0
-    }
-    p @dbg.pc
-    @dbg.singlestep
-    p @dbg.pc
-    #p @dbg,di_at(@dbg.pc)
-    sleep 1
-    @dbg.continue_wait
-    sleep 1
-    p @dbg[:eip]
-    p eax
-    eax
+    push_x86(str.len) ## arg
+    push_x86(@dbg.pc) ## ret
+    @dbg.pc  = malloc_addr
   end
 
 end
@@ -173,6 +193,11 @@ if __FILE__ == $0
 
   file = ARGV.shift || './a.out'
   inp  = ARGV.shift  || 'AAAA'
-  FuzzMem.new(file,inp)
+  bps = dasm = nil
+  while true
+    x = FuzzMem.new(file,inp,bps,dasm)
+    bps ||= x.bps
+    dasm ||= x.dasm
+  end
 
 end
