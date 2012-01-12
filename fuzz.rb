@@ -42,7 +42,7 @@ class FuzzMem < ApiHook
     @dbg  = OS.current.create_debugger(file + " " + inp)
     @dbg.callback_exception = lambda {|s| rep_vuln s}
     @fuzz = {}
-    @file = File.open(file + '.' + @dbg.pid.to_s + '.fuzz','wb')
+    @file = File.open(File.expand_path(file + '.' + @dbg.pid.to_s + '.fuzz'),"wb")
 
     @ret_reg  = case @dbg.cpu.shortname
                   when 'x64'  then :rax
@@ -57,10 +57,17 @@ class FuzzMem < ApiHook
                 end
 
 
+    @saved_ctx = {}
+
     $stderr.puts "\n\n#{file}@#{@dbg.pid}: fuzzing ...\n"
     setup = @bps.map { |f| {:address => f[0], :condition => false}}
     super(@dbg,setup,lambda {|a| hook(a)},nil)
-    File.unlink(@file.path) if @file.size == 0
+    ### jizaz ruby api suck so hard...
+    begin
+      File.unlink(@file.path) if @file.size == 0
+    rescue
+      File.unlink(@file.path) if File.size(@file.path) == 0
+    end
     @file.close
     print "\n"
   end
@@ -103,14 +110,20 @@ class FuzzMem < ApiHook
         ret = @dbg.func_retval
         $stderr.puts "malloc ret: #{ret.hex}"
         @dbg[ret,str.len] = str
-        @dbg.sp += (@dbg.cpu.size/8) ## ret does pop last arg
+
+        @dbg.ctx.do_setregs @saved_ctx[fbeg]
+        @saved_ctx.delete fbeg
+
         patch_arg(i-1,ret)
         @fuzz[fbeg][:fuzz] << [i,str]
       }
 
     else
       (@bps[fbeg] || []).each do |i|
-        str = @rnd.rndFunc[]
+        str = @rnd.rndFunc[].to_s
+
+        @saved_ctx[fbeg] = @dbg.ctx.do_getregs
+
         alloc(str)
         @fuzz[fbeg][:alloc] << [i,str]
       end
@@ -172,9 +185,12 @@ class FuzzMem < ApiHook
     return nil
   end
 
-  def push_x86(arg)
-    @dbg.sp -= 4
-    @dbg[@dbg.sp,4] = [arg].pack('V')
+  def push_arg(arg,n=0)
+    case @dbg.cpu.shortname
+      when 'ia32' then @dbg.sp -= 4 ; @dbg[@dbg.sp,4] = [arg].pack('V')
+      when 'x64'  then @dbg.func_arg_set(n,arg)
+    else raise 'unsupported arch'
+    end
   end
 
   ## only x86-linux at this point
@@ -182,8 +198,9 @@ class FuzzMem < ApiHook
     malloc_addr = find_malloc
     $stderr.puts "[*] hooking call to malloc@#{malloc_addr.hex} ret: #{@dbg.pc.hex}"
 
-    push_x86(str.len) ## arg
-    push_x86(@dbg.pc) ## ret
+    @dbg.sp -= @dbg.cpu.size / 8
+    push_arg(str.len)
+    @dbg.func_retaddr_set(@dbg.pc)
     @dbg.pc  = malloc_addr
   end
 

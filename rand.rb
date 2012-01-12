@@ -1,3 +1,24 @@
+
+class Random
+  def rand_val(rng)
+    begin
+      self.rand(rng)
+    rescue
+      rng.first + Kernel.rand(rng.last)
+    end
+  end
+
+
+  def rnd_bytes(size)
+    begin
+      self.bytes(size)
+    rescue
+      x = ''
+      size.times { x << rand_val(0..0xff).chr }
+    end
+  end
+end
+
 class FuzzLib
 
   def initialize
@@ -18,24 +39,24 @@ class FuzzLib
                        "../"*5000, "%%20x", "%2e%2e/"*1000,
                        "16777215", "0x99999999", "0xffffffff",
                        "%u000", "AAAA"+"../"+"A"*300, "%"+"A"*3000]
-    @prng = Random.new
+      @prng = ::Random.new
   end
 
   def __rndSize
-      @prng.rand(1...@maxlibSize)
+      @prng.rand_val(1...@maxlibSize)
   end
 
   def __rndList(list)
-    i = @prng.rand(0...list.size)
+    i = @prng.rand_val(0...list.size)
     list.at(i)
   end
 
   def rndBinary
-    @prng.bytes(__rndSize)
+    @prng.rnd_bytes(__rndSize)
   end
 
   def rndAscii
-    (1..__rndSize).map{|i| @prng.rand(65..90).chr}.join
+    (1..__rndSize).map{|i| @prng.rand_val(65..90).chr}.join
   end
 
 
